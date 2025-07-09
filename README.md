@@ -9,7 +9,7 @@ This README will be updated with a DOI and citation once it is published.
 
 ## Correspondence
 
-**Lead author:** David J. Kinitz 
+**Author:** David J. Kinitz 
 
 **Contact:** [kinitz.1@osu.edu](mailto:kinitz.1@osu.edu) 
 
