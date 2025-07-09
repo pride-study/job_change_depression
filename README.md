@@ -1,8 +1,8 @@
 # Changes in employment and depressive symptoms among sexual and gender minority adults
 
-This repository contains all code for the study examining how employment changes 
-affect depressive symptoms among sexual and gender minority adults in The PRIDE 
-Study.
+This repository contains all code used to conduct the analyses and generate the 
+results for the study examining how employment changes affect depressive symptoms 
+among sexual and gender minority adults in The PRIDE Study.
 
 **Status:** The manuscript based on this analysis is currently under peer review.
 This README will be updated with a DOI and citation once it is published.
