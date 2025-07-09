@@ -1,0 +1,286 @@
+---
+title: "Employment Changes and Depressive Symptoms"
+subtitle: "Data Cleaning"
+author: "Nguyen Tran"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(tidyverse) # data management
+library(here)      # specify pathways for data import
+```
+
+Import data file (AQ 2019-2023 and LHES)
+```{r load data, message=FALSE, warning=FALSE}
+# Define data file names
+files <- c("AQ2021_SF-013.csv", "AQ2022_SF-013.csv", "AQ2023_SF-013.csv", "Lifetime_SF-013_noZIP_RAISED.csv")
+
+# Read all data files and harmonize variable names
+df_list <- map(files, ~ read_csv(here("raw_data", .x), show_col_types = F) |>
+  janitor::clean_names())
+
+# Assign names to the list
+names(df_list) <- c("df21", "df22", "df23", "dflf")
+
+# Extract individual data frames as needed and filter to those who completed
+dflf <- df_list$dflf
+df21 <- df_list$df21 
+df22 <- df_list$df22 
+df23 <- df_list$df23 
+
+# Remove from global environment
+rm(files, df_list)
+```
+
+Make specific and simple changes to each individual AQ data frames
+
+-   Combine income and income2022 in AQ 2023
+-   Select `pid` and `immstatus` from LHES and remove duplicates
+```{r}
+# AQ 2023
+df23 <- df23 |> 
+  mutate(income = ifelse(is.na(income), income2022, income)) 
+
+# LHES
+dflf <- dflf |> 
+  select(pid, immstatus) |> 
+  group_by(pid) |>
+  mutate(pid_count = n()) |> 
+  filter(!(pid_count > 1 & is.na(immstatus))) |> 
+  ungroup() |> 
+  distinct(pid, .keep_all = T) |> 
+  select(-pid_count)
+```
+
+Select all variables, including exposure `occ`, outcome `phq`, and potential confounders: age, region, rural, education, immigration status, minority stress, and job discrimination. Row bind AQ 2021 - 2023 into a single data frame for data cleaning.
+```{r}
+# Define the variables to include for analysis
+v_names <- df22 |>
+  select(
+    pid, finished, age, ruca2, region,
+    genderid_1:race_ethn_8_text, ed_level,
+    pcl1:gad7, occ_1:occ_11, yrjobdisc, cars1sm:carsgms4
+  ) |>
+  names()
+
+# Create a named list of data frames
+dfs <- list(df21 = df21, df22 = df22, df23 = df23)
+
+# Apply the function and attach the respective year
+df_long <- map2_dfr(dfs, c(2021, 2022, 2023), ~ .x |>
+  filter(finished == 1) |>
+  select(any_of(v_names)) |>
+  mutate(
+    # Specify which AQ responses came from
+    survey_yr = .y
+  )) 
+
+# Clean environment 
+rm(dfs, v_names)
+```
+
+**Data cleaning**
+
+-   Outcome: calculate PHQ-9 scores
+-   Exposure: recode socio-demographics and employment
+    -   Employment: 1=any employment; 0=no employment
+    -   Out of workforce includes anyone that did not select: (1) employed, working 40 or more hours per week; (2) employed, working 1-39 hours per week; (3) temporarily employed; (4) self-employed; (5) not employed, looking for work
+```{r outcome and exposure}
+df_long <- df_long |> 
+  mutate(
+    # PHQ-9 scores
+    phq = rowSums(across(phq1:phq9)), 
+    # Count how many occupation types in main categories
+    occ_main_sum = rowSums(across(occ_1:occ_5), na.rm = T),
+    occ_total_sum = rowSums(across(occ_1:occ_11), na.rm = T),
+    # Employment status:
+    # 1=standard, 2=parttime, 3=temp, 4=self-employed, 5=unemployed, 6=nonstandard, 7=out of workforce
+    occ_cat = case_when(
+      occ_total_sum == 0 ~ NA,
+      occ_main_sum == 1 & occ_1 == 1 ~ 1,
+      occ_main_sum == 1 & occ_2 == 1 ~ 2,
+      occ_main_sum == 1 & occ_3 == 1 ~ 3,
+      occ_main_sum == 1 & occ_4 == 1 ~ 4,
+      occ_main_sum == 1 & occ_5 == 1 ~ 5,
+      # If only other types (occ_6:occ_11) selected then out of workforce
+      occ_main_sum == 0 & occ_total_sum > 0 ~ 7,
+      # If multiple main types selected then non-standard
+      occ_main_sum > 1 ~ 6
+    ),
+    # Create binary indicator for employment: 1=yes; 0=no
+    employed = case_when(
+      occ_cat %in% c(1:4,6) ~ 1, 
+      occ_cat %in% c(5,7) ~ 0, 
+      T ~ NA
+    ),
+    # Binary indicator for being out of the workforce: 1=yes; 0=no
+    out_work_force = ifelse(occ_cat == 7, 1, 0),
+    # Binary indicator for students: 1=yes; 0=no
+    student = case_when(occ_8 == 1 | occ_9 == 1 ~ 1, T ~ 0)
+  )
+```
+
+Recode potential confounders for analysis: education level, urbanicity, and CARS score for minority stress.
+```{r confounders}
+df_long <- df_long |> 
+  mutate(
+    # Education level 1: HS grad, 2: some college, 3: 4-yr grad, 4: grad degree
+    educ = case_when(
+      ed_level %in% 1:3 ~ 1,
+      ed_level %in% 4:6 ~ 2,
+      ed_level == 7 ~ 3,
+      ed_level %in% 8:10 ~ 4
+    ),
+    # Urbanicity 1: rural, 2: urban
+    # RUCA codes: https://depts.washington.edu/uwruca/ruca-uses.php
+    # Urban: includes all codes for metro/urban areas and codes that indicate 30-50% flow from metro/urban areas
+    urban = case_when(
+      ruca2 %in% c(1.0, 1.1, 2.0, 2.1, 3.0, 4.1, 5.1, 7.1, 8.1, 10.1) ~ 1,
+      is.na(ruca2) & region == "military" ~ NA,
+      is.na(ruca2) ~ NA,
+      T ~ 0
+    ), 
+    # CARS minority stress scores
+    cars_sm = rowSums(across(cars1sm:cars5sm)),
+    cars_gm = rowSums(across(cars1gm:cars5gm)),
+    # Retain the higher score for those who completed both subscales
+    cars = pmax(cars_gm, cars_sm, na.rm = T)
+  ) |> 
+  select(
+    pid, finished, age, educ, region, urban, survey_yr,
+    yrjobdisc, cars, phq, 
+    out_work_force, employed, student, occ_1:occ_11
+  )
+```
+
+Pivot data from long to wide for longitudinal analysis using marginal structural models. 
+```{r pivot wider}
+# Select variables for wide pivot 
+v_names <- df_long |> select(-pid, -survey_yr) |> names()
+
+# Identify participants who completed 2 or more annual questionnaires
+complete_pids <- df_long |> 
+  group_by(pid) |> 
+  filter(n_distinct(survey_yr) >= 2) |> 
+  pull(pid) |> 
+  unique()
+
+# Pivot wider
+df_wide <- df_long |> 
+  pivot_wider(names_from = survey_yr, 
+              values_from = all_of(v_names)) |> 
+  # Include participants who completed 2 AQ
+  filter(pid %in% complete_pids) |> 
+  # Exclude people out of work force and any students in AQ 2021 and 2022
+  mutate(
+    exclude_flag = case_when(
+      out_work_force_2021 == 0 &
+      out_work_force_2022 == 0 &
+      student_2021 == 0 &
+      student_2022 == 0 ~ 0, 
+      T ~ 1
+    )
+  ) |> 
+  # Cross stratify employment from AQ 2021 and 2022
+  mutate(emp_chg = case_when(
+    employed_2021 == 1 & employed_2022 == 1 ~ 0, 
+    employed_2021 == 0 & employed_2022 == 1 ~ 1,
+    employed_2021 == 1 & employed_2022 == 0 ~ 2, 
+    employed_2021 == 0 & employed_2022 == 0 ~ 3, 
+  )) |> 
+  # Exclude missing employment in 2021 (n = 797) and 2022 (n = 270)
+  filter(!is.na(employed_2021), !is.na(employed_2022)) 
+
+rm(complete_pids, v_names)
+```
+
+Get the most recent response for gender identity, sexual orientation, and race/ethnicity from the annual questionnaires.
+```{r recent demo response}
+# Select variables for gender identity, sexual orientation, and race/ethnicity
+v_names <- df21 |> 
+  select(
+    pid, 
+    finished, 
+    race_ethn_1:race_ethn_8, 
+    genderid_1:genderid_12,
+    orientation_1:orientation_11
+  ) |> 
+  names()
+
+df_demo_21 <- df21 |> select(v_names)
+df_demo_22 <- df22 |> select(v_names)
+df_demo_23 <- df23 |> select(v_names)
+
+# Create a named list of data frames
+df_demo_list <- list(df_demo_21 = df_demo_21, df_demo_22 = df_demo_22, df_demo_23 = df_demo_23)
+
+# Apply the function and attach the respective year
+df_demo <- map2_dfr(df_demo_list, c(2021, 2022, 2023), ~ .x |>
+  filter(finished == 1) |>
+  select(any_of(v_names)) |>
+  mutate(survey_yr = .y)) |>
+  # Select most recent AQ for each pid
+  group_by(pid) |>
+  slice_max(order_by = survey_yr, with_ties = FALSE) |>
+  ungroup() |> 
+  select(-finished, -survey_yr)
+
+# Clean environment 
+rm(v_names, df_demo_list, df_demo_21, df_demo_22, df_demo_23)
+```
+
+Left join most recent response for GI, SO, and RACE to `df_wide`.
+Left join `immstatus` from LHES to `df_wide`.
+```{r left join}
+df <- df_wide |> 
+  left_join(dflf, by = "pid") |> 
+  left_join(df_demo, by = "pid") 
+```
+
+Create binary indicators for any missing data for GI, SO, and RACE.
+Create binary indicators selecting multiple responses for GI, SO, and RACE.
+```{r}
+df <- df |> 
+  mutate(
+    gi_sum = rowSums(across(genderid_1:genderid_12), na.rm = T),
+    so_sum = rowSums(across(orientation_1:orientation_11), na.rm = T), 
+    race_sum = rowSums(across(race_ethn_1:race_ethn_8), na.rm = T),
+    gi_mul = ifelse(gi_sum > 1, 1, 0),
+    so_mul = ifelse(so_sum > 1, 1, 0),
+    race_mul = ifelse(race_sum > 1, 1, 0),
+    gi_missing = ifelse(gi_sum == 0, 1, 0),
+    so_missing = ifelse(so_sum == 0, 1, 0),
+    race_missing = ifelse(race_sum == 0, 1, 0)
+  ) |> 
+  select(-c(gi_sum, so_sum, race_sum))
+```
+
+Recode missing values for `urban` and `region`.
+Recode immigration status and past year work discrimination to be binary indicators. 
+```{r}
+df <- df |> 
+  mutate(
+    # Ensure that missing values are the same for region and urban
+    region_2021 = ifelse(is.na(urban_2021), NA, region_2021),
+    region_2022 = ifelse(is.na(urban_2022), NA, region_2022),
+    urban_2021 = ifelse(is.na(region_2021), NA, urban_2021),
+    urban_2022 = ifelse(is.na(region_2022), NA, urban_2022),
+    # Immigration status: 1=us born; 0=non-us born
+    immstatus = ifelse(immstatus == 1, 1, 0),
+    # Work discrimination, past year: 1=yes; 0=0
+    yrjobdisc_2021 = ifelse(yrjobdisc_2021 == 1, 1, 0),
+    yrjobdisc_2022 = ifelse(yrjobdisc_2022 == 1, 1, 0)
+  )
+```
+
+Save a copy of analytic data frame for analysis. Uncomment to run code and save the data. 
+```{r save df}
+# write.csv(
+#   df,
+#   here("output", "DavidKinitz_Df_EmploymentDepression_2024-10-17.csv"),
+#   row.names = F
+# )
+```

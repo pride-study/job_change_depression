@@ -1,0 +1,306 @@
+---
+title: "Employment Changes and Depressive Symptoms"
+subtitle: "Data Analysis"
+author: "Nguyen Tran"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)       # data management
+library(here)            # specify pathways for data import
+library(tableone)        # summarize descriptive results
+library(marginaleffects) # interpretation of statistical model
+library(WeightIt)        # implement IPW weighting for MSM
+library(cobalt)          # check covariate balance
+```
+
+Import analytic data frame for analysis. 
+```{r load df}
+df <- read_csv(
+  here("output", "DavidKinitz_Df_EmploymentDepression_2024-10-17.csv"), 
+  show_col_types = F
+)
+```
+
+Create functions for code that is reused frequently.
+```{r functions}
+# Print table 1 function
+print_table1 <- function(data, variables, fct_vars, strata) {
+  print(
+    CreateTableOne(
+      vars = variables,
+      factorVars = fct_vars,
+      strata = strata,
+      data = data,
+      test = T,
+      addOverall = T,
+      includeNA = T,
+    ),
+    quote = F,
+    noSpaces = T,
+    printToggle = F,
+    nonnormal = c("age_2021", "age_2022"),
+    showAllLevels = F
+  )
+}
+```
+
+Create a data frame that excludes students and other people who are out of the workforce for descriptive analysis and unadjusted modeling. 
+```{r analytic df}
+df_complete <- df |> filter(exclude_flag == 0)
+
+# Check that participants completed both AQ 2021 and 2022
+count(df_complete, finished_2021, finished_2022)
+```
+
+Create table that shows distribution of current ethnoracial identity, gender identity, and sexual orientation based on the most recent responses.
+```{r table 1}
+# Get the names of relevant variables
+v_names <- df_complete |> 
+  select(
+    race_ethn_1:race_ethn_8, race_mul, race_mul,
+    genderid_1:genderid_12, gi_mul, gi_missing,
+    orientation_1:orientation_11, so_mul, so_missing
+  ) |> 
+  names()
+
+# Create table 
+tab1 <- df_complete |>
+  pivot_longer(all_of(v_names)) |>
+  group_by(name) |>
+  count(value) |>
+  mutate(
+    pct = round(n / sum(n) * 100, 1),
+    n_pct = paste0(n, " (", pct, ")")
+  ) |>
+  filter(value == 1) |>
+  select(name, n_pct)
+
+# Save output
+# tab1
+# write.csv(tab1, here("output", "table1_race_gi_so.csv"), row.names = F)
+
+rm(v_names, tab1)
+```
+
+Create table that shows distribution of covariates for participants overall and by employment status in AQ 2021 and 2022. Immigration status (`immstatus`) was only asked in LHES (at a single timepoint). 
+```{r table 2}
+# Select relevant variables
+# AQ2021
+v_names21 <- c(
+  "age_2021", "educ_2021", "immstatus", "region_2021", 
+  "urban_2021", "yrjobdisc_2021", "cars_2021", "phq_2021"
+)
+v_fct_names21 <- c("educ_2021", "immstatus", "region_2021", "urban_2021", "yrjobdisc_2021")
+
+# AQ2022
+v_names22 <- c(
+  "age_2022", "educ_2022", "immstatus", "region_2022", 
+  "urban_2022", "yrjobdisc_2022", "cars_2022", "phq_2022"
+)
+v_fct_names22 <- c("educ_2022", "immstatus", "region_2022", "urban_2022", "yrjobdisc_2022")
+
+# Create table stratified by employment groups
+table2_21 <- print_table1(df_complete, v_names21, v_fct_names21, strata = "employed_2021")
+table2_22 <- print_table1(df_complete, v_names22, v_fct_names22, strata = "employed_2022")
+
+# Save output
+# write.csv(table2_21, "output/table2_AQ2021.csv")
+# write.csv(table2_22, "output/table2_AQ2022.csv")
+
+# Clean environment
+rm(v_names21, v_fct_names21, v_names22, v_fct_names22, table2_21, table2_22)
+```
+
+Check missing phq scores for AQ2021 and 2022
+```{r phq missing}
+count(df_complete, is.na(phq_2021))
+count(df_complete, is.na(phq_2021), employed_2021)
+count(df_complete, is.na(phq_2022))
+count(df_complete, is.na(phq_2022), employed_2022)
+```
+
+Calculate the mean and SD for PHQ by employment in AQ 2021 and 2022.
+```{r phq by employment change}
+df_complete |>
+  group_by(employed_2021, employed_2022) |>
+  summarise(
+    n = n(),
+    pct = (n / nrow(df_complete)) * 100,
+    mean_phq = mean(phq_2023, na.rm = T),
+    sd_phq = sd(phq_2023, na.rm = T),
+  )
+```
+
+Fit unadjusted linear regression models that examine the associations between changes in employment from 2021 to 2022 and depressive symptoms in 2023. 
+```{r unadjusted regression}
+# Make sure that exposure is a factor in data frame
+df_complete <- df_complete |> 
+  mutate(emp_chg = as.factor(emp_chg))
+
+m0 = lm(phq_2023 ~ factor(emp_chg), data = df_complete)
+```
+
+Estimate the joint effect of employment changes between 2021 and 2022 on depressive symptoms in 2023 with robust standard errors. Reference group is sustained employment from 2021 to 2022. Estimates are interpreted as between group differences in mean phq scores. 
+```{r unadjusted outputs}
+avg_comparisons(m0, variables = "emp_chg", vcov = "HC3")
+```
+
+Fit marginal structural models. These are models that use IPW to adjust for time-varying confounding. Note that immigration status is only measured in LHES and treated as time-invariant in the model.
+
+Construct stabilized IP weights for AQ 2021 and AQ 2022. Missing values for each variable are treated by creating a new missingness indicator to talke on the value of 1 if covariate is NA and 0 otherwise. 
+```{r treatment ipw}
+sw_a <- weightitMSM(
+  list(
+    employed_2021 ~ age_2021 + educ_2021 + region_2021 + urban_2021 +
+      yrjobdisc_2021 + cars_2021 + immstatus + phq_2021,
+    employed_2022 ~ age_2021 + age_2022 + educ_2021 + educ_2022 + region_2021 +
+      region_2022 + urban_2021 + urban_2022 + yrjobdisc_2021 + yrjobdisc_2022 +
+      cars_2021 + cars_2022 + immstatus + phq_2021 + phq_2022 + employed_2021
+  ),
+  data = df_complete,
+  method = "glm",
+  stabilize = T,
+  num.formula = list(
+    ~1,
+    ~ age_2021 + educ_2021 + region_2021 + urban_2021 +
+      yrjobdisc_2021 + cars_2021 + immstatus + phq_2021 + employed_2021
+  ),
+  is.MSM.method = F
+)
+
+# Extract weights for models
+summary(sw_a[["weights"]])
+df_complete$sw_a <- sw_a[["weights"]]
+
+# Check distribution of weights at 99th percentile 
+quantile(df_complete$sw_a, c(0.01, 0.99))
+```
+
+Plot the distribution of weights at each time points and check for covariate balance. 
+```{r plot treatment ipw}
+plot(summary(sw_a), time = 1)
+plot(summary(sw_a), time = 2)
+summary(sw_a)
+
+# Check metrics for covariate balance
+bal.tab(sw_a, stats = c("m", "ks"))
+```
+
+Check for selection bias due to censoring by comparing employment and depressive symptoms between those who are censored and those who are not 
+-   If people did not complete AQ 2023, they were considered LFTU and censored
+```{r check ltfu}
+df_complete <- df_complete |>
+  mutate(
+    cens = ifelse(is.na(finished_2023), 1, 0),
+    unemployed_2021 = ifelse(employed_2021 == 1, 0, 1),
+    unemployed_2022 = ifelse(employed_2022 == 1, 0, 1)
+  )
+
+# Select relevant variables
+# AQ2021
+v_names21 <- c(
+  "age_2021", "educ_2021", "immstatus", "region_2021", 
+  "urban_2021", "yrjobdisc_2021", "cars_2021", "phq_2021"
+)
+v_fct_names21 <- c("educ_2021", "immstatus", "region_2021", "urban_2021", "yrjobdisc_2021")
+
+# AQ2022
+v_names22 <- c(
+  "age_2022", "educ_2022", "immstatus", "region_2022", 
+  "urban_2022", "yrjobdisc_2022", "cars_2022", "phq_2022"
+)
+v_fct_names22 <- c("educ_2022", "immstatus", "region_2022", "urban_2022", "yrjobdisc_2022")
+
+# Create table stratified by censoring 
+table_cen21 <- print_table1(df_complete, v_names21, v_fct_names21, strata = "cens")
+table_cen22 <- print_table1(df_complete, v_names22, v_fct_names22, strata = "cens")
+
+# Save output
+# write.csv(table_cen21, "output/tab_censor_AQ2021.csv")
+# write.csv(table_cen22, "output/tab_censor_AQ2022.csv")
+
+# Clean environment
+rm(var_list_2021, var_list_2022, table_cen21, table_cen22)
+```
+There is evidence that people who were censored have higher depressive symptoms and prevalence of losing employment and remaining unemployed. This suggests potential selection bias due to LFTU. 
+
+Construct stablized IPW censoring weights. 
+```{r lftu ipw}
+sw_c <- weightitMSM(
+  list(cens ~ age_2021 + age_2022 + educ_2021 + educ_2022 + region_2021 +
+    region_2022 + urban_2021 + urban_2022 + yrjobdisc_2021 + yrjobdisc_2022 +
+    cars_2021 + cars_2022 + immstatus + phq_2021 + phq_2022 + employed_2021 + employed_2022),
+  data = df_complete,
+  method = "glm",
+  estimand = "ATE",
+  stabilize = T,
+  num.formula = list(
+    ~ age_2021 + educ_2021 + region_2021 + urban_2021 +
+      yrjobdisc_2021 + cars_2021 + immstatus + employed_2021 + phq_2021
+  ),
+  is.MSM.method = F
+)
+
+# Extract weights for models
+summary(sw_c[["weights"]])
+df_complete$sw_c <- sw_c[["weights"]]
+quantile(df_complete$sw_c, c(0.01, 0.99))
+```
+
+Plot the distribution of weights at each time points and check for covariate balance. 
+```{r plot ltfu ipw}
+plot(summary(sw_c), time = 1)
+plot(summary(sw_c), time = 2)
+summary(sw_c)
+
+# Check metrics for covariate balance
+bal.tab(sw_c, stats = c("m", "ks"))
+```
+
+Take product of treatment and censoring weights to construct the final weights that will be used to fit the marginal structural models.
+```{r final weights}
+df_complete$sw <- df_complete$sw_c * df_complete$sw_a
+
+summary(df_complete$sw)
+quantile(df_complete$sw, c(0.01, 0.99))
+```
+
+Truncate treatment and censoring weights to reduce the influence of outliers. Calculate final truncated weights by take the product of the truncated treatment and censoring weights.
+```{r ipw truncation}
+df_complete <- df_complete |>
+  mutate(
+    sw_a_truncated = ifelse(sw_a > quantile(sw_a, 0.99), quantile(sw_a, 0.99), sw_a),
+    sw_c_truncated = ifelse(sw_c > quantile(sw_c, 0.99), quantile(sw_c, 0.99), sw_c)
+  )
+
+df_complete$sw_truncated <- df_complete$sw_c_truncated * df_complete$sw_a_truncated
+```
+
+Create table the reports the distribution of weights before and after truncation. 
+```{r ipw distribution}
+df_complete |> 
+  select(sw_a, sw_c, sw, sw_a_truncated, sw_c_truncated, sw_truncated) |> 
+  pivot_longer(cols = everything()) |> 
+  group_by(name) |> 
+  summarise(mean(value), median(value), min(value), quantile(value, 0.01), quantile(value, 0.99), max(value))
+```
+
+Fit margnial structural models using GEE. 
+```{r}
+m1 <- geepack::geeglm(
+  phq_2023 ~ factor(emp_chg),
+  data = df_complete,
+  weights = sw_truncated,
+  id = pid,
+  corstr = "independence"
+)
+```
+
+Estimate the joint effect of employment changes between 2021 and 2022 on depressive symptoms in 2023. Reference group is sustained employment from 2021 to 2022. Estimates are interpreted as between group differences in mean phq scores. 
+```{r unadjusted outputs}
+avg_comparisons(m1, variables = "emp_chg")
+```
