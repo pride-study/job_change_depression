@@ -280,7 +280,7 @@ Save a copy of analytic data frame for analysis. Uncomment to run code and save 
 ```{r save df}
 # write.csv(
 #   df,
-#   here("output", "DavidKinitz_Df_EmploymentDepression_2024-10-17.csv"),
+#   here("output", "df_anal_2024-10-17.csv"),
 #   row.names = F
 # )
 ```
