@@ -20,7 +20,7 @@ library(cobalt)          # check covariate balance
 Import analytic data frame for analysis. 
 ```{r load df}
 df <- read_csv(
-  here("output", "DavidKinitz_Df_EmploymentDepression_2024-10-17.csv"), 
+  here("output", "df_anal_2024-10-17.csv"), 
   show_col_types = F
 )
 ```
