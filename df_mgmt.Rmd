@@ -1,7 +1,7 @@
 ---
 title: "Employment Changes and Depressive Symptoms"
 subtitle: "Data Cleaning"
-author: "Nguyen Tran"
+author: "Nguyen K Tran"
 date: "`r Sys.Date()`"
 output: html_document
 ---
