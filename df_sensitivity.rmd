@@ -1,0 +1,227 @@
+---
+title: "Employment Changes and Depressive Symptoms"
+subtitle: "Sensitivity Analysis"
+author: "Nguyen Tran"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)       # data management
+library(here)            # specify pathways for data import
+library(tableone)        # summarize descriptive results
+library(marginaleffects) # interpretation of statistical model
+library(WeightIt)        # implement IPW weighting for MSM
+library(cobalt)          # check covariate balance
+```
+
+Import analytic data frame for analysis.
+
+```{r load df}
+df <- readr::read_csv(
+  here::here("..", "output", "temp_data", "df_anal_2026-03-16.csv"), 
+  show_col_types = F
+)
+
+df_complete <- readr::read_csv(
+  here::here("..", "output", "temp_data", "df_anal_complete_2026-03-16.csv"), 
+  show_col_types = F
+)
+```
+
+```{r}
+df <- df |> 
+  dplyr::mutate(
+    emp_chg = as.factor(emp_chg),
+    cens = ifelse(is.na(finished_2023), 1, 0),
+    unemployed_2021 = ifelse(employed_2021 == 1, 0, 1),
+    unemployed_2022 = ifelse(employed_2022 == 1, 0, 1)
+  )
+```
+
+## Sensitivity analysis
+
+1. Exclude participants who reported unemployed, looking for work and one of the following or in combination: fulltime, partime, temporary, self
+2. Adjustment/effect modification by ethnoracial group
+
+### 1. Exclude participants reporting concurrent employment and unemployment 
+
+```{r check concur emp & unemp}
+# Check number of individuals reporting concurrent employment/unemployment
+df_complete |> dplyr::count(employed_2021, any_unemployed_2021, employed_2022, any_unemployed_2022)
+```
+
+```{r exclude}
+df_complete <- df_complete |> 
+  dplyr::mutate(
+    exclude_flag2 = dplyr::case_when(
+      (employed_2021 == 1 & any_unemployed_2021 == 1) |
+      (employed_2022 == 1 & any_unemployed_2022 == 1) ~ 1,
+      T ~ 0
+    )
+  )
+
+df_complete_sen1 <- df_complete |> 
+  dplyr::filter(exclude_flag2 == 0)
+```
+
+```{r num for each emp change}
+# Calculate number of people by employment status over time afte exclusion 
+df_complete_sen1 |> 
+  group_by(emp_chg) |> 
+  dplyr::summarise(
+    n = n(),
+    pct = n/nrow(df_complete_sen1) * 100,
+    mean(phq_2023, na.rm = T),
+    sd(phq_2023, na.rm = T)
+  )
+```
+
+```{r sens model1}
+# Estimate the effect after exclusion based on model specification in primary analysis
+m1 <- geepack::geeglm(
+  phq_2023 ~ factor(emp_chg),
+  data = df_complete_sen1,
+  weights = sw_truncated,
+  id = pid,
+  corstr = "independence"
+)
+
+marginaleffects::avg_comparisons(m1, variables = "emp_chg")
+```
+
+### 2. Effect modification by gender and race
+
+Add gender and ethnoracial group to the model for constructing IP weights 
+
+```{r modified trt weights}
+sw_a2 <- WeightIt::weightitMSM(
+  list(
+    employed_2021 ~ age_2021 + educ_2021 + region_2021 + urban_2021 +
+      yrjobdisc_2021 + cars_2021 + immstatus + phq_2021 + gi_bin + race_bin,
+    employed_2022 ~ age_2021 + age_2022 + educ_2021 + educ_2022 + region_2021 +
+      region_2022 + urban_2021 + urban_2022 + yrjobdisc_2021 + yrjobdisc_2022 +
+      cars_2021 + cars_2022 + immstatus + phq_2021 + gi_bin + race_bin + phq_2022 + employed_2021
+  ),
+  data = df_complete,
+  method = "glm",
+  stabilize = T,
+  num.formula = list(
+    ~1,
+    ~ age_2021 + educ_2021 + region_2021 + urban_2021 +
+      yrjobdisc_2021 + cars_2021 + immstatus + phq_2021 + employed_2021 + gi_bin + race_bin
+  ),
+  is.MSM.method = F
+)
+
+# Extract weights for models
+summary(sw_a2[["weights"]])
+df_complete$sw_a2 <- sw_a2[["weights"]]
+
+# Check distribution of weights at 99th percentile 
+quantile(df_complete$sw_a, c(0.01, 0.99))
+```
+
+Plot the distribution of weights at each time points and check for covariate balance.
+
+```{r plot treatment ipw}
+plot(summary(sw_a2), time = 1)
+plot(summary(sw_a2), time = 2)
+summary(sw_a2)
+
+# Check metrics for covariate balance
+cobalt::bal.tab(sw_a2, stats = c("m", "ks"))
+```
+
+Take product of new treatment (including gender and ethnoracial groups) and censoring weights to construct the final weights that will be used to fit the marginal structural models.
+
+```{r final weights}
+df_complete$sw2 <- df_complete$sw_c * df_complete$sw_a2
+
+summary(df_complete$sw2)
+quantile(df_complete$sw2, c(0.01, 0.99))
+```
+
+Truncate treatment and censoring weights to reduce the influence of outliers. Calculate final truncated weights by take
+the product of the truncated treatment and censoring weights.
+
+```{r ipw truncation}
+df_complete_sen2 <- df_complete |>
+  dplyr::mutate(
+    sw_a2_truncated = ifelse(sw_a2 > quantile(sw_a, 0.99), quantile(sw_a2, 0.99), sw_a2),
+  )
+
+df_complete_sen2$sw2_truncated <- df_complete_sen2$sw_c_truncated * df_complete_sen2$sw_a2_truncated
+```
+
+Create table the reports the distribution of weights before and after truncation.
+
+```{r ipw distribution}
+df_complete_sen2 |> 
+  dplyr::select(sw_a2, sw2, sw_a2_truncated, sw2_truncated) |> 
+  tidyr::pivot_longer(cols = everything()) |> 
+  dplyr::group_by(name) |> 
+  dplyr::summarise(mean(value), median(value), min(value), quantile(value, 0.01), quantile(value, 0.99), max(value))
+```
+
+#### 2.1 Gender
+
+Calculate the mean and SD for PHQ by employment in AQ 2021 and 2022 by gender.
+
+```{r phq by employment change}
+df_complete_sen2 |>
+  dplyr::group_by(gi_bin, employed_2021, employed_2022) |>
+  dplyr::summarise(
+    n = n(),
+    pct = (n / nrow(df_complete)) * 100,
+    mean_phq = mean(phq_2023, na.rm = T),
+    sd_phq = sd(phq_2023, na.rm = T),
+  )
+```
+
+Fit marginal structural models with effect modification by gender groups using GEE to estimate the joint effect of employment changes between 2021 and 2022 on depressive symptoms in 2023 for cisgender and transgender and nonbinary groups separately. Reference group
+is sustained employment from 2021 to 2022. Estimates are interpreted as between group differences in mean phq scores.
+
+```{r msm by gender} 
+m2 <- geepack::geeglm(
+  phq_2023 ~ factor(emp_chg) * factor(gi_bin),
+  data = df_complete_sen2,
+  weights = sw2_truncated,
+  id = pid,
+  corstr = "independence"
+)
+
+marginaleffects::avg_comparisons(m2, variables = "emp_chg", by = "gi_bin")
+```
+
+#### 2.2 Ethnoracial 
+
+Calculate the mean and SD for PHQ by employment in AQ 2021 and 2022 by ethnoracial.
+
+```{r phq by employment change}
+df_complete_sen2 |>
+  dplyr::group_by(race_bin, employed_2021, employed_2022) |>
+  dplyr::summarise(
+    n = n(),
+    pct = (n / nrow(df_complete)) * 100,
+    mean_phq = mean(phq_2023, na.rm = T),
+    sd_phq = sd(phq_2023, na.rm = T),
+  )
+```
+
+Fit marginal structural models with effect modification by ethnoracial groups using GEE to estimate the joint effect of employment changes between 2021 and 2022 on depressive symptoms in 2023 for cisgender and transgender and nonbinary groups separately. Reference group
+is sustained employment from 2021 to 2022. Estimates are interpreted as between group differences in mean phq scores.
+
+```{r msm by race} 
+m3 <- geepack::geeglm(
+  phq_2023 ~ factor(emp_chg) * factor(race_bin),
+  data = df_complete_sen2,
+  weights = sw2_truncated,
+  id = pid,
+  corstr = "independence"
+)
+
+marginaleffects::avg_comparisons(m2, variables = "emp_chg", by = "race_bin")
+```
